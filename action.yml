@@ -31,6 +31,10 @@ inputs:
     description: 'Comma-separated list of checks to run (empty = all).'
     required: false
     default: ''
+  cli-version:
+    description: 'npm semver spec of @vibecodeqa/cli to run. Defaults to the range this action release was tested against.'
+    required: false
+    default: '^0.45.0'
   anthropic-api-key:
     description: 'Anthropic API key for AI autofix (required if auto-fix is true).'
     required: false
@@ -80,7 +84,7 @@ runs:
 
         # Run scan (don't fail yet — we need to parse output first)
         set +e
-        OUTPUT=$(npx @vibecodeqa/cli@latest $FLAGS 2>&1)
+        OUTPUT=$(npx "@vibecodeqa/cli@${{ inputs.cli-version }}" $FLAGS 2>&1)
         EXIT_CODE=$?
         set -e
 
@@ -123,7 +127,7 @@ runs:
         fi
 
         echo "Running AI autofix..."
-        npx @vibecodeqa/cli@latest fix --ai 2>&1 || true
+        npx "@vibecodeqa/cli@${{ inputs.cli-version }}" fix --ai 2>&1 || true
 
         # Check if any files were modified
         if git diff --quiet; then
