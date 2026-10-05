@@ -24,6 +24,23 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The validation step holds its own copy of the cli-version default, used
+      # when a caller passes ''. The two must not drift apart.
+      - name: cli-version default is the same in both places
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # the single-quoted text is JavaScript
+          node -e '
+            const src = require("node:fs").readFileSync("action.yml", "utf8");
+            const input = src.match(/\n  cli-version:\n(?:    .*\n)*?    default: '"'"'([^'"'"']+)'"'"'/);
+            const step = src.match(/CLI_VERSION_DEFAULT: '"'"'([^'"'"']+)'"'"'/);
+            if (!input || !step) { console.error("cli-version default not found"); process.exit(1); }
+            if (input[1] !== step[1]) { console.error(`input default ${input[1]} != CLI_VERSION_DEFAULT ${step[1]}`); process.exit(1); }
+            console.log(`cli-version default ${input[1]} in both places`);
+          '
 
       - name: Scan
         id: vcqa
@@ -48,12 +65,37 @@ jobs:
           [ -f "$REPORT_PATH/report.json" ]
           [ -f "$REPORT_PATH/report.sarif" ]
 
+      # Wrappers that forward an unset input pass ''. That must mean the
+      # default, as it did in 1.0, not a validation failure.
+      - name: Empty-string inputs use the defaults
+        id: empty
+        uses: ./
+        with:
+          fail-under: ''
+          skip-tests: ''
+          auto-fix: ''
+          cli-version: ''
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the empty-input scan succeeded
+        env:
+          OUTCOME: ${{ steps.empty.outcome }}
+          SCORE: ${{ steps.empty.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "success" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
   npm-warnings:
     name: Success — npm warnings on stderr do not corrupt outputs
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # An unknown npm_config_* makes every npm/npx call print
       # `npm warn Unknown env config ...` on stderr. The previous action merged
@@ -78,12 +120,59 @@ jobs:
           [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
           [[ "$GRADE" =~ ^[ABCDF]$ ]]
 
+  pr-comment:
+    name: PR comment — posted on this pull request
+    # Needs a write token, which pull requests from forks never get.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A minute early, so runner/API clock skew cannot fail the comparison.
+      - name: Record the start time
+        id: start
+        run: echo "at=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Scan with pr-comment
+        id: vcqa
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'true'
+
+      # The CLI marks its comment with <!-- vcqa-report --> and updates it in
+      # place, so assert that the marked comment was created or updated by this run.
+      - name: Assert the comment was posted or updated
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+          SCORE: ${{ steps.vcqa.outputs.score }}
+        run: |
+          set -euo pipefail
+          comment=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            | jq -s 'add | [.[] | select(.body | contains("<!-- vcqa-report -->"))] | last // {}')
+          updated=$(jq -r '.updated_at // ""' <<< "$comment")
+          echo "marker comment updated_at=$updated (run started $SINCE), score=$SCORE"
+          [ -n "$updated" ]
+          [[ "$updated" > "$SINCE" || "$updated" == "$SINCE" ]]
+          jq -r '.body' <<< "$comment" | grep -q "$SCORE/100"
+
   expected-failures:
     name: Expected failures — gate, config gate, crash, bad input
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Quality gate from the input. Logs "Score N is below the minimum 101".
       - name: fail-under 101
@@ -154,23 +243,48 @@ jobs:
           [ "$OUTCOME" = "failure" ]
           [ -z "$SCORE" ]
 
-      # Malformed inputs fail before anything is downloaded or run.
-      - name: Malformed inputs
-        id: invalid
+      # Malformed inputs fail before anything is downloaded or run. One input
+      # per case, so each check is proven on its own.
+      - name: Malformed fail-under
+        id: bad-fail-under
         continue-on-error: true
         uses: ./
         with:
           fail-under: 'eighty'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Malformed boolean
+        id: bad-boolean
+        continue-on-error: true
+        uses: ./
+        with:
+          skip-tests: 'yes'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Malformed cli-version
+        id: bad-cli-version
+        continue-on-error: true
+        uses: ./
+        with:
           cli-version: '--registry=https://example.invalid'
           sarif: 'false'
           pr-comment: 'false'
 
-      - name: Assert malformed inputs failed the step with no score
+      - name: Assert each malformed input failed its step with no score
         env:
-          OUTCOME: ${{ steps.invalid.outcome }}
-          SCORE: ${{ steps.invalid.outputs.score }}
+          FAIL_UNDER_OUTCOME: ${{ steps.bad-fail-under.outcome }}
+          FAIL_UNDER_SCORE: ${{ steps.bad-fail-under.outputs.score }}
+          BOOLEAN_OUTCOME: ${{ steps.bad-boolean.outcome }}
+          BOOLEAN_SCORE: ${{ steps.bad-boolean.outputs.score }}
+          CLI_VERSION_OUTCOME: ${{ steps.bad-cli-version.outcome }}
+          CLI_VERSION_SCORE: ${{ steps.bad-cli-version.outputs.score }}
         run: |
           set -euo pipefail
-          echo "outcome=$OUTCOME score=$SCORE"
-          [ "$OUTCOME" = "failure" ]
-          [ -z "$SCORE" ]
+          echo "fail-under: $FAIL_UNDER_OUTCOME '$FAIL_UNDER_SCORE'"
+          echo "boolean: $BOOLEAN_OUTCOME '$BOOLEAN_SCORE'"
+          echo "cli-version: $CLI_VERSION_OUTCOME '$CLI_VERSION_SCORE'"
+          [ "$FAIL_UNDER_OUTCOME" = "failure" ] && [ -z "$FAIL_UNDER_SCORE" ]
+          [ "$BOOLEAN_OUTCOME" = "failure" ] && [ -z "$BOOLEAN_SCORE" ]
+          [ "$CLI_VERSION_OUTCOME" = "failure" ] && [ -z "$CLI_VERSION_SCORE" ]
