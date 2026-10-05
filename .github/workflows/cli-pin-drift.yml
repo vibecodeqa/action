@@ -1,0 +1,89 @@
+# Watches the pinned scan engine for drift (vibecodeqa/action#3).
+#
+# The `cli-version` input in action.yml defaults to a caret on a 0.x version,
+# which is a MINOR range: every @v1 user runs that minor line until the default
+# is bumped and a release is cut. The pin is deliberate — an unpinned engine
+# changes every consumer's results with no change in this repo (#1) — but it
+# previously sat eleven minors behind because nothing was watching.
+#
+# Once a week, compare the published CLI against the pin and file an issue when
+# it has moved on. It does not bump anything itself: a bump changes consumers'
+# scores and ships only through a release (release.yml). Mirrors
+# vibecodeqa/mcp .github/workflows/cli-pin-drift.yml.
+name: CLI pin drift
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays, 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Compare published CLI against the pin
+        id: drift
+        run: |
+          set -euo pipefail
+          # Parsed with node rather than sed/grep: BSD and GNU sed regexes differ,
+          # and the default sits a few lines below the `cli-version:` key.
+          PINNED=$(node -e '
+            const src = require("node:fs").readFileSync("action.yml", "utf8");
+            const m = src.match(/\n  cli-version:\n(?:    .*\n)*?    default: .\^?([0-9]+\.[0-9]+\.[0-9]+)./);
+            if (!m) { console.error("cli-version default not found in action.yml"); process.exit(1); }
+            process.stdout.write(m[1]);
+          ')
+          LATEST=$(npm view @vibecodeqa/cli version)
+          echo "pinned=$PINNED  latest=$LATEST"
+          {
+            echo "pinned=$PINNED"
+            echo "latest=$LATEST"
+            if [ "${PINNED%.*}" = "${LATEST%.*}" ]; then
+              echo "drifted=false"
+            else
+              echo "drifted=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: File an issue when the pin is behind
+        if: steps.drift.outputs.drifted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "cli-version pins @vibecodeqa/cli ${{ steps.drift.outputs.pinned }}, published is ${{ steps.drift.outputs.latest }}"
+          BODY: |
+            The `cli-version` input in `action.yml` defaults to
+            `^${{ steps.drift.outputs.pinned }}`; the published CLI is
+            `${{ steps.drift.outputs.latest }}`. A caret on a `0.x` version is a
+            minor range, so `@v1` users will not pick this up on their own.
+
+            To move the pin:
+
+            1. Bump the `cli-version` default in `action.yml` to the new minor.
+            2. Check the self-test workflow passes on the pull request.
+            3. Note in the release notes whether users' scores move.
+            4. Cut a release with the Release workflow, which tags `v1.x.y` and moves `v1`.
+
+            Filed automatically by `.github/workflows/cli-pin-drift.yml`.
+        run: |
+          set -euo pipefail
+          # Idempotent: don't stack a new issue every Monday for the same drift.
+          EXISTING=$(gh issue list --state open --label cli-pin-drift --json title \
+            --jq "[.[] | select(.title == \"$TITLE\")] | length")
+          if [ "$EXISTING" != "0" ]; then
+            echo "Issue already open for this drift; nothing to do."
+            exit 0
+          fi
+          gh label create cli-pin-drift --color ededed \
+            --description "Pinned scan engine is behind the published CLI" 2>/dev/null || true
+          gh issue create --title "$TITLE" --label cli-pin-drift --body "$BODY"
