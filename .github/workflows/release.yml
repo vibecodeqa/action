@@ -1,0 +1,100 @@
+# Cuts a release (R-GHA-8): an immutable vX.Y.Z tag on a commit of main, and
+# the floating major tag (v1) moved to the same commit.
+#
+# Run from the Actions tab on main with the version to release. Nothing is
+# tagged unless the self-test passes on that exact commit. Tags are never cut
+# from a developer machine.
+#
+#   v1.2.3  immutable: never moved or deleted once pushed
+#   v1      moving by design, and only ever forward along main
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the leading v (e.g. 1.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  self-test:
+    name: Self-test the release commit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/self-test.yml
+
+  release:
+    name: Tag and publish
+    needs: self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main only, not $REF."
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::version must be X.Y.Z with no prefix or pre-release suffix, got '$VERSION'."
+            exit 1
+          fi
+          MAJOR="v${BASH_REMATCH[1]}"
+          TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG already exists. Version tags are immutable; pick the next version."
+            exit 1
+          fi
+          # The new version must be higher than every existing release in its major.
+          HIGHEST=$(git tag --list "$MAJOR.*.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -n "$HIGHEST" ] && [ "$(printf '%s\n%s\n' "$HIGHEST" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
+            echo "::error::$TAG is not higher than the latest release $HIGHEST."
+            exit 1
+          fi
+          # The major tag only moves forward along main.
+          if git rev-parse -q --verify "refs/tags/$MAJOR" >/dev/null \
+            && ! git merge-base --is-ancestor "refs/tags/$MAJOR^{commit}" "$GITHUB_SHA"; then
+            echo "::error::$MAJOR points at a commit that is not an ancestor of $GITHUB_SHA; refusing to move it sideways."
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "major=$MAJOR"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG at $GITHUB_SHA and moving $MAJOR."
+
+      - name: Create the version tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+
+      - name: Move the major tag
+        env:
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$MAJOR"
