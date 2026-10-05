@@ -147,6 +147,9 @@ runs:
         tmp="${RUNNER_TEMP:-/tmp}"
         sentinel="$tmp/vcqa-scan-start"
         : > "$sentinel"
+        # The CLI writes report.sarif after report.json; a throw in between
+        # must not leave an earlier run's SARIF to be uploaded as this one's.
+        rm -f .vibe-check/report.sarif
         set +e
         npx --yes "@vibecodeqa/cli@$CLI_VERSION" "${args[@]}" > "$tmp/vcqa-stdout.json"
         cli_exit=$?

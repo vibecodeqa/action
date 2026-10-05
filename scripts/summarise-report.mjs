@@ -79,7 +79,8 @@ function setOutput(name, value) {
 const report = readFreshReport();
 
 if (report) {
-	const grade = typeof report.grade === "string" ? report.grade : "";
+	// Validated, not passed through: it goes into a workflow command and $GITHUB_OUTPUT.
+	const grade = typeof report.grade === "string" && /^[A-F]$/.test(report.grade) ? report.grade : "";
 	const issues = Array.isArray(report.checks)
 		? report.checks.reduce((n, c) => n + (Array.isArray(c?.issues) ? c.issues.length : 0), 0)
 		: 0;
