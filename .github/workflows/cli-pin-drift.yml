@@ -19,14 +19,18 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -56,34 +60,48 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-      - name: File an issue when the pin is behind
+      # One open issue at a time, found by label and kept under a stable title.
+      # Later drift (0.57.0, then 0.57.1, then 0.58.0) is a comment on that
+      # issue, once per published version, not a new issue each Monday.
+      - name: File or update the drift issue
         if: steps.drift.outputs.drifted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TITLE: "cli-version pins @vibecodeqa/cli ${{ steps.drift.outputs.pinned }}, published is ${{ steps.drift.outputs.latest }}"
-          BODY: |
-            The `cli-version` input in `action.yml` defaults to
-            `^${{ steps.drift.outputs.pinned }}`; the published CLI is
-            `${{ steps.drift.outputs.latest }}`. A caret on a `0.x` version is a
-            minor range, so `@v1` users will not pick this up on their own.
-
-            To move the pin:
-
-            1. Bump the `cli-version` default in `action.yml` to the new minor.
-            2. Check the self-test workflow passes on the pull request.
-            3. Note in the release notes whether users' scores move.
-            4. Cut a release with the Release workflow, which tags `v1.x.y` and moves `v1`.
-
-            Filed automatically by `.github/workflows/cli-pin-drift.yml`.
+          PINNED: ${{ steps.drift.outputs.pinned }}
+          LATEST: ${{ steps.drift.outputs.latest }}
         run: |
           set -euo pipefail
-          # Idempotent: don't stack a new issue every Monday for the same drift.
-          EXISTING=$(gh issue list --state open --label cli-pin-drift --json title \
-            --jq "[.[] | select(.title == \"$TITLE\")] | length")
-          if [ "$EXISTING" != "0" ]; then
-            echo "Issue already open for this drift; nothing to do."
-            exit 0
-          fi
+          TITLE="cli-version default is behind the published @vibecodeqa/cli"
+          LINE="Published \`@vibecodeqa/cli@$LATEST\`; \`cli-version\` defaults to \`^$PINNED\`."
           gh label create cli-pin-drift --color ededed \
             --description "Pinned scan engine is behind the published CLI" 2>/dev/null || true
+          EXISTING=$(gh issue list --state open --label cli-pin-drift --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            if gh issue view "$EXISTING" --json body,comments --jq '[.body, .comments[].body] | join("\n")' \
+              | grep -qF "@vibecodeqa/cli@$LATEST\`"; then
+              echo "Issue #$EXISTING already records $LATEST; nothing to do."
+            else
+              gh issue comment "$EXISTING" --body "$LINE"
+            fi
+            exit 0
+          fi
+          BODY=$(cat <<EOF
+          $LINE
+
+          A caret on a \`0.x\` version is a minor range, so \`@v1\` users will not pick
+          this up on their own.
+
+          To move the pin:
+
+          1. Bump the \`cli-version\` default in \`action.yml\`, and \`CLI_VERSION_DEFAULT\`
+             in its validation step, to the new minor. The self-test fails if they differ.
+          2. Check the self-test workflow passes on the pull request.
+          3. Add the score change to the "Upgrading" notes in the README, which become
+             the release body.
+          4. Cut a release with the Release workflow, which tags \`v1.x.y\` and moves \`v1\`.
+
+          Filed automatically by \`.github/workflows/cli-pin-drift.yml\`. Later drift is
+          added here as comments; close this issue when the pin is current.
+          EOF
+          )
           gh issue create --title "$TITLE" --label cli-pin-drift --body "$BODY"
