@@ -1,0 +1,178 @@
+# Cuts a release (R-GHA-8): a vX.Y.Z tag on a commit of main, and the floating
+# major tag (v1) moved to the same commit.
+#
+# Run from the Actions tab on main with the version to release. Nothing is
+# tagged unless the self-test passes on that exact commit. Tags are never cut
+# from a developer machine.
+#
+#   v1.2.3  never moved or deleted once pushed
+#   v1      moving by design, and only ever forward along main
+#
+# Order matters: both tags go up in ONE atomic push, and only then is the GitHub
+# release created against the existing tag. If anything fails part-way, re-run
+# the workflow with the same version: a vX.Y.Z that already points at this
+# commit is accepted, and a release that already exists is left alone.
+#
+# Token: moving v1 across commits that add or change .github/workflows/* can be
+# refused for GITHUB_TOKEN ("refusing to allow a GitHub App to create or update
+# workflow ... without `workflows` permission"), and GITHUB_TOKEN cannot be
+# granted that permission. If the push is refused, store RELEASE_TOKEN — a
+# fine-grained token for vibecodeqa/action with Contents: read and write and
+# Workflows: read and write — as a secret of the `release` ENVIRONMENT, whose
+# deployment branches are limited to main. Not as a repository secret: any
+# same-repo branch could read that, including a branch whose own copy of this
+# file drops the main-only check. This job runs in that environment, so GitHub
+# withholds the secret from every other ref. The job uses RELEASE_TOKEN when it
+# is set and falls back to GITHUB_TOKEN otherwise.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the leading v (e.g. 1.1.0)'
+        required: true
+        type: string
+      notes-section:
+        description: >-
+          Optional README heading (without the ##) whose section opens the release
+          notes, e.g. "Upgrading from 1.0". Empty: generated notes only.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  self-test:
+    name: Self-test the release commit
+    # A called workflow may not ask for more than its caller grants, and the
+    # self-test's pr-comment job declares pull-requests: write (it is skipped
+    # here, since this is not a pull_request event).
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/self-test.yml
+
+  release:
+    name: Tag and publish
+    needs: self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Holds RELEASE_TOKEN, if one is needed (see the header). Restrict the
+    # environment's deployment branches to main.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # Credentials are persisted here, unlike the other workflows: this job
+      # exists to push tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Validate the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main only."
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::version must be X.Y.Z with no prefix or pre-release suffix."
+            exit 1
+          fi
+          MAJOR="v${BASH_REMATCH[1]}"
+          TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            # A re-run of the same release is fine; reusing a version for another commit is not.
+            if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG already exists on another commit. Version tags are never moved; pick the next version."
+              exit 1
+            fi
+            echo "$TAG already points at $GITHUB_SHA; continuing as a re-run."
+          fi
+          # The new version must be the highest release in its major.
+          HIGHEST=$(git tag --list "$MAJOR.*.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -n "$HIGHEST" ] && [ "$(printf '%s\n%s\n' "$HIGHEST" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
+            echo "::error::$TAG is not higher than the latest release $HIGHEST."
+            exit 1
+          fi
+          # The major tag only moves forward along main.
+          if git rev-parse -q --verify "refs/tags/$MAJOR" >/dev/null \
+            && ! git merge-base --is-ancestor "refs/tags/$MAJOR^{commit}" "$GITHUB_SHA"; then
+            echo "::error::$MAJOR points at a commit that is not an ancestor of $GITHUB_SHA; refusing to move it sideways."
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "major=$MAJOR"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG at $GITHUB_SHA and moving $MAJOR."
+
+      # One atomic push: either everything lands or nothing does.
+      # - vX.Y.Z is pushed only if it does not exist yet. On a re-run it already
+      #   points at this commit (validation checked), possibly as an annotated
+      #   tag, so it is left exactly as it is.
+      # - v1 is moved with a lease on the value fetched at checkout, so a manual
+      #   move made since then is not silently overwritten.
+      - name: Push the version tag and move the major tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          refspecs=()
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git tag "$TAG" "$GITHUB_SHA"
+            refspecs+=("refs/tags/$TAG")
+          fi
+          expected=$(git rev-parse -q --verify "refs/tags/$MAJOR" || true) # empty: must not exist yet
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          refspecs+=("refs/tags/$MAJOR")
+          git push --atomic --force-with-lease="refs/tags/$MAJOR:$expected" origin "${refspecs[@]}"
+
+      # Release notes: GitHub's generated notes, opened by a README section when
+      # notes-section names one. Same-page links are rewritten to the README at
+      # this tag, since #anchors are dead in a release body.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SECTION: ${{ inputs.notes-section }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to do."
+            exit 0
+          fi
+          if [ -z "$SECTION" ]; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+            exit 0
+          fi
+          notes="${RUNNER_TEMP}/release-notes.md"
+          # shellcheck disable=SC2016 # the single-quoted text is JavaScript
+          HEADING="## $SECTION" README_URL="https://github.com/$GITHUB_REPOSITORY/blob/$TAG/README.md" \
+            node -e '
+              const fs = require("node:fs");
+              const { HEADING, README_URL } = process.env;
+              const lines = fs.readFileSync("README.md", "utf8").split("\n");
+              const start = lines.findIndex((l) => l.trim() === HEADING);
+              if (start === -1) { console.error(`README.md has no "${HEADING}" heading`); process.exit(1); }
+              let end = lines.findIndex((l, i) => i > start && /^## /.test(l));
+              if (end === -1) end = lines.length;
+              const body = lines.slice(start, end).join("\n").replace(/\]\(#/g, `](${README_URL}#`);
+              process.stdout.write(body.trimEnd() + "\n");
+            ' > "$notes"
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$notes" --generate-notes

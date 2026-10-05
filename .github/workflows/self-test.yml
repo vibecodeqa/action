@@ -1,0 +1,314 @@
+# Runs the action from this repository the way a consumer runs it (R-GHA-10),
+# over the success path and every failure path the action distinguishes.
+# It scans this repository itself; no job depends on what the score is, only
+# on its shape and on the step conclusions.
+#
+# Also called by release.yml: nothing is tagged unless this passes on the
+# commit being released.
+name: Self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  success:
+    name: Success — numeric outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The validation step holds its own copy of the cli-version default, used
+      # when a caller passes ''. The two must not drift apart.
+      - name: cli-version default is the same in both places
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # the single-quoted text is JavaScript
+          node -e '
+            const src = require("node:fs").readFileSync("action.yml", "utf8");
+            const input = src.match(/\n  cli-version:\n(?:    .*\n)*?    default: '"'"'([^'"'"']+)'"'"'/);
+            const step = src.match(/CLI_VERSION_DEFAULT: '"'"'([^'"'"']+)'"'"'/);
+            if (!input || !step) { console.error("cli-version default not found"); process.exit(1); }
+            if (input[1] !== step[1]) { console.error(`input default ${input[1]} != CLI_VERSION_DEFAULT ${step[1]}`); process.exit(1); }
+            console.log(`cli-version default ${input[1]} in both places`);
+          '
+
+      - name: Scan
+        id: vcqa
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.vcqa.outputs.score }}
+          GRADE: ${{ steps.vcqa.outputs.grade }}
+          ISSUES: ${{ steps.vcqa.outputs.issues }}
+          REPORT_PATH: ${{ steps.vcqa.outputs.report-path }}
+        run: |
+          set -euo pipefail
+          echo "score=$SCORE grade=$GRADE issues=$ISSUES report-path=$REPORT_PATH"
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+          [[ "$GRADE" =~ ^[ABCDF]$ ]]
+          [[ "$ISSUES" =~ ^[0-9]+$ ]]
+          [ -f "$REPORT_PATH/report.json" ]
+          [ -f "$REPORT_PATH/report.sarif" ]
+
+      # Wrappers that forward an unset input pass ''. That must mean the
+      # default, as it did in 1.0, not a validation failure.
+      - name: Empty-string inputs use the defaults
+        id: empty
+        uses: ./
+        with:
+          fail-under: ''
+          skip-tests: ''
+          auto-fix: ''
+          cli-version: ''
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the empty-input scan succeeded
+        env:
+          OUTCOME: ${{ steps.empty.outcome }}
+          SCORE: ${{ steps.empty.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "success" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
+  npm-warnings:
+    name: Success — npm warnings on stderr do not corrupt outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # An unknown npm_config_* makes every npm/npx call print
+      # `npm warn Unknown env config ...` on stderr. The previous action merged
+      # stderr into the JSON it parsed, which turned this into score=0, grade=?.
+      - name: Scan with npm warnings
+        id: vcqa
+        uses: ./
+        env:
+          NPM_CONFIG_VCQA_SELFTEST_WARNING: '1'
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.vcqa.outputs.score }}
+          GRADE: ${{ steps.vcqa.outputs.grade }}
+        run: |
+          set -euo pipefail
+          echo "score=$SCORE grade=$GRADE"
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+          [[ "$GRADE" =~ ^[ABCDF]$ ]]
+
+  pr-comment:
+    name: PR comment — posted on this pull request
+    # Needs a write token, which pull requests from forks never get.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    # One run per PR at a time, so another run's comment update cannot land
+    # between this run's before/after reads. Job-level rather than workflow-
+    # level: release.yml calls this workflow, and a workflow-level group could
+    # cancel the release's self-test.
+    concurrency:
+      group: self-test-pr-comment-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The CLI updates the FIRST comment carrying <!-- vcqa-report -->
+      # (cli src/pr-comment.ts, `find`), or creates one if there is none. Record
+      # that comment before the scan and require it to be strictly newer after,
+      # so an earlier run's update cannot pass for this one's.
+      - name: Record the marker comment before the scan
+        id: before
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          first=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            | jq -s -c 'add | map(select(.body | contains("<!-- vcqa-report -->"))) | first // {}')
+          id=$(jq -r '.id // ""' <<< "$first")
+          updated=$(jq -r '.updated_at // ""' <<< "$first")
+          echo "before: id=${id:-none} updated_at=${updated:-none}"
+          { echo "id=$id"; echo "updated=$updated"; } >> "$GITHUB_OUTPUT"
+
+      - name: Scan with pr-comment
+        id: vcqa
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'true'
+
+      - name: Assert this run posted or updated the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE_ID: ${{ steps.before.outputs.id }}
+          BEFORE_UPDATED: ${{ steps.before.outputs.updated }}
+          SCORE: ${{ steps.vcqa.outputs.score }}
+        run: |
+          set -euo pipefail
+          first=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            | jq -s -c 'add | map(select(.body | contains("<!-- vcqa-report -->"))) | first // {}')
+          id=$(jq -r '.id // ""' <<< "$first")
+          updated=$(jq -r '.updated_at // ""' <<< "$first")
+          echo "after: id=${id:-none} updated_at=${updated:-none} (before: id=${BEFORE_ID:-none} updated_at=${BEFORE_UPDATED:-none}), score=$SCORE"
+          [ -n "$id" ]
+          if [ -n "$BEFORE_ID" ]; then
+            # Updated in place: same comment, strictly newer.
+            [ "$id" = "$BEFORE_ID" ]
+            [[ "$updated" > "$BEFORE_UPDATED" ]]
+          fi
+          jq -r '.body' <<< "$first" | grep -qF "$SCORE/100"
+
+  expected-failures:
+    name: Expected failures — gate, config gate, crash, bad input
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Quality gate from the input. Logs "Score N is below the minimum 101".
+      - name: fail-under 101
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          fail-under: '101'
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      # A gate that fails must fail the step, and still report the score.
+      - name: Assert the gate failed the step
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          SCORE: ${{ steps.gate.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
+      # Quality gate from the project's own config, with fail-under left at 0.
+      # The previous action exited 0 here: it only propagated failure when the
+      # fail-under input was non-zero.
+      - name: Write a .vcqa.json gate
+        run: echo '{"failUnder":101}' > .vcqa.json
+
+      - name: .vcqa.json failUnder 101
+        id: config-gate
+        continue-on-error: true
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the config gate failed the step
+        env:
+          OUTCOME: ${{ steps.config-gate.outcome }}
+          SCORE: ${{ steps.config-gate.outputs.score }}
+        run: |
+          set -euo pipefail
+          rm .vcqa.json
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
+      # The CLI cannot run at all. Logs "This is a scan failure, not a
+      # quality-gate result", and leaves the outputs empty rather than inventing 0.
+      - name: Unresolvable cli-version
+        id: crash
+        continue-on-error: true
+        uses: ./
+        with:
+          cli-version: '0.0.0-vcqa-selftest-missing'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the crash failed the step with no score
+        env:
+          OUTCOME: ${{ steps.crash.outcome }}
+          SCORE: ${{ steps.crash.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [ -z "$SCORE" ]
+
+      # Malformed inputs fail before anything is downloaded or run. One input
+      # per case, so each check is proven on its own.
+      - name: Malformed fail-under
+        id: bad-fail-under
+        continue-on-error: true
+        uses: ./
+        with:
+          fail-under: 'eighty'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Malformed boolean
+        id: bad-boolean
+        continue-on-error: true
+        uses: ./
+        with:
+          skip-tests: 'yes'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Malformed cli-version
+        id: bad-cli-version
+        continue-on-error: true
+        uses: ./
+        with:
+          cli-version: '--registry=https://example.invalid'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert each malformed input failed its step with no score
+        env:
+          FAIL_UNDER_OUTCOME: ${{ steps.bad-fail-under.outcome }}
+          FAIL_UNDER_SCORE: ${{ steps.bad-fail-under.outputs.score }}
+          BOOLEAN_OUTCOME: ${{ steps.bad-boolean.outcome }}
+          BOOLEAN_SCORE: ${{ steps.bad-boolean.outputs.score }}
+          CLI_VERSION_OUTCOME: ${{ steps.bad-cli-version.outcome }}
+          CLI_VERSION_SCORE: ${{ steps.bad-cli-version.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "fail-under: $FAIL_UNDER_OUTCOME '$FAIL_UNDER_SCORE'"
+          echo "boolean: $BOOLEAN_OUTCOME '$BOOLEAN_SCORE'"
+          echo "cli-version: $CLI_VERSION_OUTCOME '$CLI_VERSION_SCORE'"
+          [ "$FAIL_UNDER_OUTCOME" = "failure" ] && [ -z "$FAIL_UNDER_SCORE" ]
+          [ "$BOOLEAN_OUTCOME" = "failure" ] && [ -z "$BOOLEAN_SCORE" ]
+          [ "$CLI_VERSION_OUTCOME" = "failure" ] && [ -z "$CLI_VERSION_SCORE" ]
