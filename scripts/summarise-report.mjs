@@ -95,7 +95,9 @@ if (report) {
 
 	const threshold =
 		failUnderInput > 0 ? { value: failUnderInput, source: "the fail-under input" } : configFailUnder(process.cwd());
-	if (threshold && threshold.value > 0 && report.score < threshold.value) {
+	// The CLI's quality gate exits exactly 1. Any other code (137 from an OOM
+	// kill, say) is a scan failure even if the score happens to be low.
+	if (cliExit === 1 && threshold && threshold.value > 0 && report.score < threshold.value) {
 		console.log(
 			`::error title=VibeCode QA quality gate::Score ${report.score} is below the minimum ${threshold.value} (set by ${threshold.source}).`,
 		);
