@@ -1,0 +1,176 @@
+# Runs the action from this repository the way a consumer runs it (R-GHA-10),
+# over the success path and every failure path the action distinguishes.
+# It scans this repository itself; no job depends on what the score is, only
+# on its shape and on the step conclusions.
+#
+# Also called by release.yml: nothing is tagged unless this passes on the
+# commit being released.
+name: Self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  success:
+    name: Success — numeric outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan
+        id: vcqa
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.vcqa.outputs.score }}
+          GRADE: ${{ steps.vcqa.outputs.grade }}
+          ISSUES: ${{ steps.vcqa.outputs.issues }}
+          REPORT_PATH: ${{ steps.vcqa.outputs.report-path }}
+        run: |
+          set -euo pipefail
+          echo "score=$SCORE grade=$GRADE issues=$ISSUES report-path=$REPORT_PATH"
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+          [[ "$GRADE" =~ ^[ABCDF]$ ]]
+          [[ "$ISSUES" =~ ^[0-9]+$ ]]
+          [ -f "$REPORT_PATH/report.json" ]
+          [ -f "$REPORT_PATH/report.sarif" ]
+
+  npm-warnings:
+    name: Success — npm warnings on stderr do not corrupt outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # An unknown npm_config_* makes every npm/npx call print
+      # `npm warn Unknown env config ...` on stderr. The previous action merged
+      # stderr into the JSON it parsed, which turned this into score=0, grade=?.
+      - name: Scan with npm warnings
+        id: vcqa
+        uses: ./
+        env:
+          NPM_CONFIG_VCQA_SELFTEST_WARNING: '1'
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.vcqa.outputs.score }}
+          GRADE: ${{ steps.vcqa.outputs.grade }}
+        run: |
+          set -euo pipefail
+          echo "score=$SCORE grade=$GRADE"
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+          [[ "$GRADE" =~ ^[ABCDF]$ ]]
+
+  expected-failures:
+    name: Expected failures — gate, config gate, crash, bad input
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Quality gate from the input. Logs "Score N is below the minimum 101".
+      - name: fail-under 101
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          fail-under: '101'
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      # A gate that fails must fail the step, and still report the score.
+      - name: Assert the gate failed the step
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          SCORE: ${{ steps.gate.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
+      # Quality gate from the project's own config, with fail-under left at 0.
+      # The previous action exited 0 here: it only propagated failure when the
+      # fail-under input was non-zero.
+      - name: Write a .vcqa.json gate
+        run: echo '{"failUnder":101}' > .vcqa.json
+
+      - name: .vcqa.json failUnder 101
+        id: config-gate
+        continue-on-error: true
+        uses: ./
+        with:
+          skip-tests: 'true'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the config gate failed the step
+        env:
+          OUTCOME: ${{ steps.config-gate.outcome }}
+          SCORE: ${{ steps.config-gate.outputs.score }}
+        run: |
+          set -euo pipefail
+          rm .vcqa.json
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+
+      # The CLI cannot run at all. Logs "This is a scan failure, not a
+      # quality-gate result", and leaves the outputs empty rather than inventing 0.
+      - name: Unresolvable cli-version
+        id: crash
+        continue-on-error: true
+        uses: ./
+        with:
+          cli-version: '0.0.0-vcqa-selftest-missing'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert the crash failed the step with no score
+        env:
+          OUTCOME: ${{ steps.crash.outcome }}
+          SCORE: ${{ steps.crash.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [ -z "$SCORE" ]
+
+      # Malformed inputs fail before anything is downloaded or run.
+      - name: Malformed inputs
+        id: invalid
+        continue-on-error: true
+        uses: ./
+        with:
+          fail-under: 'eighty'
+          cli-version: '--registry=https://example.invalid'
+          sarif: 'false'
+          pr-comment: 'false'
+
+      - name: Assert malformed inputs failed the step with no score
+        env:
+          OUTCOME: ${{ steps.invalid.outcome }}
+          SCORE: ${{ steps.invalid.outputs.score }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME score=$SCORE"
+          [ "$OUTCOME" = "failure" ]
+          [ -z "$SCORE" ]
