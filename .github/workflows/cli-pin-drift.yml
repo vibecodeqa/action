@@ -96,8 +96,9 @@ jobs:
           1. Bump the \`cli-version\` default in \`action.yml\`, and \`CLI_VERSION_DEFAULT\`
              in its validation step, to the new minor. The self-test fails if they differ.
           2. Check the self-test workflow passes on the pull request.
-          3. Add the score change to the "Upgrading" notes in the README, which become
-             the release body.
+          3. Note the score change in an "Upgrading" section of the README, and name
+             that heading in the Release workflow's \`notes-section\` input so it
+             opens the release notes.
           4. Cut a release with the Release workflow, which tags \`v1.x.y\` and moves \`v1\`.
 
           Filed automatically by \`.github/workflows/cli-pin-drift.yml\`. Later drift is

@@ -99,7 +99,7 @@ the checkout step:
 Pinning the action does not pin the scanner. The action runs
 `npx @vibecodeqa/cli@<cli-version>`, and the default `cli-version` is a range, so a SHA-pinned
 action still runs whichever matching CLI version was published last, with that job's token
-and secrets. Privileged workflows should pin both:
+and secrets. Privileged workflows should set an exact `cli-version` as well as the action SHA:
 
 ```yaml
 # vibecodeqa/action@v1.2.3
@@ -107,6 +107,11 @@ and secrets. Privileged workflows should pin both:
   with:
     cli-version: '0.56.0' # exact version, not a range
 ```
+
+An exact `cli-version` pins the CLI package, not what it depends on. The CLI is published
+without an `npm-shrinkwrap.json` and declares its dependencies as caret ranges, so `npx`
+resolves the newest matching versions on every run. The SHA plus an exact `cli-version`
+narrows what can change under you; it does not freeze the code that runs.
 
 The action's own nested actions (`actions/setup-node`, `github/codeql-action/upload-sarif`)
 are pinned by commit SHA inside `action.yml`.
@@ -154,7 +159,11 @@ is never read.
 | --- | --- | --- |
 | Scan succeeded, gate passed or not set | `::notice` with grade, score and issue count | success |
 | CLI exited 1 with the score below `fail-under`, or below `failUnder` from the project config | `::error` "VibeCode QA quality gate — Score N is below the minimum M (set by …)" | failure |
-| Any other non-zero exit (install failure, crash, out-of-memory kill, no report), whatever the score | `::error` "VibeCode QA failed — … This is a scan failure, not a quality-gate result" | failure |
+| Any other failure: a non-zero exit other than 1 (an out-of-memory kill, say), or no valid report (install failure, crash before the report) | `::error` "VibeCode QA failed — … This is a scan failure, not a quality-gate result" | failure |
+
+The CLI also exits 1 when it fails after writing its report, for example when posting the
+PR comment throws. If the score is below the threshold at the same time, that case is
+labelled a quality-gate failure. The step fails either way.
 | Malformed input | one `::error` per bad input | failure |
 
 The CLI's stderr, including npm warnings, stays in the log. It does not affect the outputs.
@@ -172,15 +181,21 @@ The CLI's stderr, including npm warnings, stays in the log. It does not affect t
 Releases are cut by the [Release](.github/workflows/release.yml) workflow, run from the
 Actions tab on `main` with a version number. It runs the [self-test](.github/workflows/self-test.yml)
 on that commit, pushes `vX.Y.Z` and the moved `v1` in one atomic push, then publishes a
-GitHub release whose notes start with [Upgrading from 1.0](#upgrading-from-10). `v1` only
-moves forward along `main`. The workflow never moves or deletes a `vX.Y.Z` tag, and nothing is
+GitHub release with generated notes. Give the workflow's `notes-section` input a README
+heading, such as `Upgrading from 1.0`, to open the notes with that section. `v1` only
+moves forward along `main`. `v1` is moved with a lease, so a manual move made during the
+run is refused, not overwritten. The workflow never moves or deletes a `vX.Y.Z` tag, and nothing is
 tagged from a developer machine. The repository does not yet enforce that with a tag
 ruleset, so treat a SHA, not `vX.Y.Z`, as the guarantee.
 
-If the tag push is refused because the commits since the last release change
-`.github/workflows/`, add a `RELEASE_TOKEN` repository secret (a fine-grained token for this
-repository with Contents and Workflows read and write). The workflow uses it in place of
-`GITHUB_TOKEN` when it is set. A failed run can be re-run with the same version.
+The release job runs in the `release` environment, which should be restricted to the `main`
+branch. If the tag push is refused because the commits since the last release change
+`.github/workflows/`, store a `RELEASE_TOKEN` as a secret **of that environment**, not of the
+repository. It should be a fine-grained token for this repository with Contents and
+Workflows read and write. A repository secret can be read by a workflow run on any branch of
+this repository; an environment secret is withheld from refs the environment does not allow.
+The workflow uses the token in place of `GITHUB_TOKEN` when it is set. A failed run can be
+re-run with the same version.
 
 [CLI pin drift](.github/workflows/cli-pin-drift.yml) checks every Monday whether a newer
 CLI minor has been published, and opens an issue when the `cli-version` default is behind.
@@ -214,6 +229,12 @@ at before this release: `vibecodeqa/action@3b9c61990f2d61a646b2eba5c67475c74e5d6
   input" warning; use `checks` in `.vcqa.json` instead.
 - **Malformed inputs fail the step.** `fail-under` must be an integer, and the boolean inputs
   must be `'true'` or `'false'`. An empty string still means the default.
+- **`cli-version` is validated.** It must be an npm version, range or dist-tag. `npm:`
+  aliases, git and `file:` specs, URLs, and anything starting with `-` are now rejected.
+- **The nested actions need a Node 24 action runtime.** `actions/setup-node` moved from v4 to
+  v7.0.0, and `github/codeql-action/upload-sarif` from v3 to v4.38.2. Both run on `node24`
+  (1.0's ran on `node20`). Self-hosted or GitHub Enterprise Server runners too old to run
+  `node24` actions now fail at "Setup Node.js", where 1.0 worked.
 - **SARIF is uploaded only from this run's report**, never a leftover file.
 - **`anthropic-api-key` is no longer passed to the scan step**, only to autofix.
 
