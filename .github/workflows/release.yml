@@ -1,12 +1,25 @@
-# Cuts a release (R-GHA-8): an immutable vX.Y.Z tag on a commit of main, and
-# the floating major tag (v1) moved to the same commit.
+# Cuts a release (R-GHA-8): a vX.Y.Z tag on a commit of main, and the floating
+# major tag (v1) moved to the same commit.
 #
 # Run from the Actions tab on main with the version to release. Nothing is
 # tagged unless the self-test passes on that exact commit. Tags are never cut
 # from a developer machine.
 #
-#   v1.2.3  immutable: never moved or deleted once pushed
+#   v1.2.3  never moved or deleted once pushed
 #   v1      moving by design, and only ever forward along main
+#
+# Order matters: both tags go up in ONE atomic push, and only then is the GitHub
+# release created against the existing tag. If anything fails part-way, re-run
+# the workflow with the same version: a vX.Y.Z that already points at this
+# commit is accepted, and a release that already exists is left alone.
+#
+# Token: moving v1 across commits that add or change .github/workflows/* can be
+# refused for GITHUB_TOKEN ("refusing to allow a GitHub App to create or update
+# workflow ... without `workflows` permission"), and GITHUB_TOKEN cannot be
+# granted that permission. If the push is refused, add a repository secret
+# RELEASE_TOKEN: a fine-grained token for vibecodeqa/action with Contents:
+# read and write and Workflows: read and write. This workflow uses it when it
+# is set and falls back to GITHUB_TOKEN otherwise.
 name: Release
 
 on:
@@ -27,8 +40,12 @@ concurrency:
 jobs:
   self-test:
     name: Self-test the release commit
+    # A called workflow may not ask for more than its caller grants, and the
+    # self-test's pr-comment job declares pull-requests: write (it is skipped
+    # here, since this is not a pull_request event).
     permissions:
       contents: read
+      pull-requests: write
     uses: ./.github/workflows/self-test.yml
 
   release:
@@ -39,10 +56,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Credentials are persisted here, unlike the other workflows: this job
+      # exists to push tags.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
       - name: Validate the version
         id: version
@@ -52,20 +72,24 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::Releases are cut from main only, not $REF."
+            echo "::error::Releases are cut from main only."
             exit 1
           fi
           if ! [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            echo "::error::version must be X.Y.Z with no prefix or pre-release suffix, got '$VERSION'."
+            echo "::error::version must be X.Y.Z with no prefix or pre-release suffix."
             exit 1
           fi
           MAJOR="v${BASH_REMATCH[1]}"
           TAG="v$VERSION"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error::$TAG already exists. Version tags are immutable; pick the next version."
-            exit 1
+            # A re-run of the same release is fine; reusing a version for another commit is not.
+            if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG already exists on another commit. Version tags are never moved; pick the next version."
+              exit 1
+            fi
+            echo "$TAG already points at $GITHUB_SHA; continuing as a re-run."
           fi
-          # The new version must be higher than every existing release in its major.
+          # The new version must be the highest release in its major.
           HIGHEST=$(git tag --list "$MAJOR.*.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
           if [ -n "$HIGHEST" ] && [ "$(printf '%s\n%s\n' "$HIGHEST" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
             echo "::error::$TAG is not higher than the latest release $HIGHEST."
@@ -83,18 +107,32 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Releasing $TAG at $GITHUB_SHA and moving $MAJOR."
 
-      - name: Create the version tag and release
+      # One atomic push: either both tags land or neither does.
+      - name: Push the version tag and move the major tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          git tag -f "$TAG" "$GITHUB_SHA"   # no-op on a re-run; validation refused any other commit
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          git push --atomic origin "refs/tags/$TAG" "+refs/tags/$MAJOR"
+
+      # The upgrade notes in the README go at the top of the release body.
+      - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
-
-      - name: Move the major tag
-        env:
-          MAJOR: ${{ steps.version.outputs.major }}
-        run: |
-          set -euo pipefail
-          git tag -f "$MAJOR" "$GITHUB_SHA"
-          git push --force origin "refs/tags/$MAJOR"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to do."
+            exit 0
+          fi
+          notes="${RUNNER_TEMP}/release-notes.md"
+          awk '/^## Upgrading from 1\.0/{on=1} on && /^## / && !/^## Upgrading from 1\.0/{exit} on' README.md > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "::error::README.md has no '## Upgrading from 1.0' section to put in the release notes."
+            exit 1
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$notes" --generate-notes
