@@ -129,15 +129,35 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # One run per PR at a time, so another run's comment update cannot land
+    # between this run's before/after reads. Job-level rather than workflow-
+    # level: release.yml calls this workflow, and a workflow-level group could
+    # cancel the release's self-test.
+    concurrency:
+      group: self-test-pr-comment-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # A minute early, so runner/API clock skew cannot fail the comparison.
-      - name: Record the start time
-        id: start
-        run: echo "at=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      # The CLI updates the FIRST comment carrying <!-- vcqa-report -->
+      # (cli src/pr-comment.ts, `find`), or creates one if there is none. Record
+      # that comment before the scan and require it to be strictly newer after,
+      # so an earlier run's update cannot pass for this one's.
+      - name: Record the marker comment before the scan
+        id: before
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          first=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            | jq -s -c 'add | map(select(.body | contains("<!-- vcqa-report -->"))) | first // {}')
+          id=$(jq -r '.id // ""' <<< "$first")
+          updated=$(jq -r '.updated_at // ""' <<< "$first")
+          echo "before: id=${id:-none} updated_at=${updated:-none}"
+          { echo "id=$id"; echo "updated=$updated"; } >> "$GITHUB_OUTPUT"
 
       - name: Scan with pr-comment
         id: vcqa
@@ -147,23 +167,27 @@ jobs:
           sarif: 'false'
           pr-comment: 'true'
 
-      # The CLI marks its comment with <!-- vcqa-report --> and updates it in
-      # place, so assert that the marked comment was created or updated by this run.
-      - name: Assert the comment was posted or updated
+      - name: Assert this run posted or updated the comment
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-          SINCE: ${{ steps.start.outputs.at }}
+          BEFORE_ID: ${{ steps.before.outputs.id }}
+          BEFORE_UPDATED: ${{ steps.before.outputs.updated }}
           SCORE: ${{ steps.vcqa.outputs.score }}
         run: |
           set -euo pipefail
-          comment=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
-            | jq -s 'add | [.[] | select(.body | contains("<!-- vcqa-report -->"))] | last // {}')
-          updated=$(jq -r '.updated_at // ""' <<< "$comment")
-          echo "marker comment updated_at=$updated (run started $SINCE), score=$SCORE"
-          [ -n "$updated" ]
-          [[ "$updated" > "$SINCE" || "$updated" == "$SINCE" ]]
-          jq -r '.body' <<< "$comment" | grep -q "$SCORE/100"
+          first=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            | jq -s -c 'add | map(select(.body | contains("<!-- vcqa-report -->"))) | first // {}')
+          id=$(jq -r '.id // ""' <<< "$first")
+          updated=$(jq -r '.updated_at // ""' <<< "$first")
+          echo "after: id=${id:-none} updated_at=${updated:-none} (before: id=${BEFORE_ID:-none} updated_at=${BEFORE_UPDATED:-none}), score=$SCORE"
+          [ -n "$id" ]
+          if [ -n "$BEFORE_ID" ]; then
+            # Updated in place: same comment, strictly newer.
+            [ "$id" = "$BEFORE_ID" ]
+            [[ "$updated" > "$BEFORE_UPDATED" ]]
+          fi
+          jq -r '.body' <<< "$first" | grep -qF "$SCORE/100"
 
   expected-failures:
     name: Expected failures — gate, config gate, crash, bad input
